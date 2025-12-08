@@ -1196,6 +1196,21 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
                 // is this the first message?
                 const firstPartMessage = data.subarray(0, 4).toString() === MAGIC_WORD;
 
+                // Discard malformed packets that don't start with MAGIC_WORD when no message is in progress
+                // This prevents infinite loops when devices send packets with incorrect format
+                if (!firstPartMessage && this.currentMessageBuilder[message.type].header.bytesToRead === 0) {
+                    rootP2PLogger.warn(`Discarding malformed P2P packet (does not start with MAGIC_WORD)`, {
+                        stationSN: this.rawStation.station_sn,
+                        seqNo: message.seqNo,
+                        dataType: P2PDataType[message.type],
+                        first4Bytes: data.subarray(0, 4).toString("hex"),
+                        dataLength: data.length
+                    });
+                    data = Buffer.from([]);
+                    this.currentMessageState[message.type].leftoverData = Buffer.from([]);
+                    break;
+                }
+
                 if (firstPartMessage) {
                     const header: P2PDataHeader = {
                         commandId: 0,
@@ -1278,7 +1293,17 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
             } while ((data.length > 0) && (runaway_limit < this.LOOP_RUNAWAY_LIMIT))
             if (runaway_limit >= this.LOOP_RUNAWAY_LIMIT) {
                 rootP2PLogger.warn(`Infinite loop detected (limit >= ${this.LOOP_RUNAWAY_LIMIT}) during parsing of p2p message`, { stationSN: this.rawStation.station_sn, seqNo: message.seqNo, dataType: P2PDataType[message.type], header: this.currentMessageBuilder[message.type].header, bytesRead: this.currentMessageBuilder[message.type].bytesRead, bytesToRead: this.currentMessageBuilder[message.type].header.bytesToRead, message: message.data.toString("hex"), messageSize: message.data.length });
+                
+                // Enhanced recovery for infinite loop
                 this.initializeMessageBuilder(message.type);
+                // Also clear leftover data to prevent cascade failures
+                this.currentMessageState[message.type].leftoverData = Buffer.from([]);
+                
+                // For T84A1P1025021F7C, temporarily disable video streaming to prevent continuous errors
+                if (this.rawStation.station_sn === "T84A1P1025021F7C" && message.type === P2PDataType.VIDEO) {
+                    rootP2PLogger.warn(`T84A1P1025021F7C: Temporarily disabling video stream due to parsing errors`);
+                    this.endStream(P2PDataType.VIDEO, false);
+                }
             }
         }
     }
