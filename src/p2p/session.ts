@@ -241,6 +241,7 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
             audioStream: null,
             invalidStream: false,
             p2pStreaming: false,
+            p2pStreamEnding: false,
             p2pStreamNotStarted: true,
             p2pStreamChannel: -1,
             p2pStreamFirstAudioDataReceived: false,
@@ -2498,6 +2499,9 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
 
     private endStream(datatype: P2PDataType, sendStopCommand = false): void {
         if (this.currentMessageState[datatype].p2pStreaming) {
+            // Set ending flag to prevent race condition with new stream starts
+            this.currentMessageState[datatype].p2pStreamEnding = true;
+            
             if (sendStopCommand) {
                 switch (datatype) {
                     case P2PDataType.VIDEO:
@@ -2545,6 +2549,9 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
             this.initializeMessageState(datatype, this.currentMessageState[datatype].rsaKey);
             this.initializeStream(datatype);
             this.closeEnergySavingDevice();
+            
+            // Clear ending flag after cleanup is complete
+            this.currentMessageState[datatype].p2pStreamEnding = false;
         }
     }
 
@@ -2575,7 +2582,7 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
 
     public isStreaming(channel: number, datatype: P2PDataType): boolean {
         if (this.currentMessageState[datatype].p2pStreamChannel === channel)
-            return this.currentMessageState[datatype].p2pStreaming;
+            return this.currentMessageState[datatype].p2pStreaming || this.currentMessageState[datatype].p2pStreamEnding;
         return false;
     }
 

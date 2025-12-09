@@ -115,6 +115,7 @@ export interface P2PDataMessageState {
     audioStream: Readable | null;
     invalidStream: boolean;
     p2pStreaming: boolean;
+    p2pStreamEnding: boolean;
     p2pStreamNotStarted: boolean;
     p2pStreamChannel: number;
     p2pStreamFirstAudioDataReceived: boolean;
