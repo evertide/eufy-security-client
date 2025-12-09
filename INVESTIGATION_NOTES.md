@@ -154,12 +154,58 @@ Both issues are now addressed:
 1. **p2pStreamEnding flag** (commit 885bfd6) - prevents race during active cleanup
 2. **Always emit stop event** (this fix) - ensures flag is cleared even with no data
 
+### Solution Implemented
+
+**Two-layer fix required:**
+
+1. **eufy-security-client patch** (session.js):
+   - Remove `&& !p2pStreamNotStarted` condition from stop event emission
+   - Ensures event is always emitted when stream ends
+
+2. **eufy-security-ws patch** (message_handler.js):
+   - Add 35-second timeout fallback that clears `receiveLivestream` flag
+   - Acts as safety net when event chain fails (e.g., channel=-1 lookup failure)
+
+The event chain failure happens because:
+- When no data is received, `p2pStreamChannel` remains `-1`
+- `eufysecurity.js` calls `getStationDevice(stationSN, -1)` which throws `DeviceNotFoundError`
+- The error is caught but `"station livestream stop"` event is never emitted
+- `eufy-security-ws` never receives the event to clear its flag
+
+### Runtime Patch (v1.9.24)
+
+The fix is deployed via runtime patching in `patch-eufy-client.sh`:
+
+```bash
+# eufy-security-client: Remove p2pStreamNotStarted check
+sed -i 's/\.invalidStream && !this\.currentMessageState\[datatype\]\.p2pStreamNotStarted/.invalidStream/' "$SESSION_FILE"
+
+# eufy-security-ws: Add timeout fallback
+sed -i 's/client\.receiveLivestream\[serialNumber\] = true;/client.receiveLivestream[serialNumber] = true; setTimeout(() => { if (client.receiveLivestream[serialNumber] === true) { console.log("[eufy-ws-patch] Stream timeout - clearing flag for " + serialNumber); client.receiveLivestream[serialNumber] = false; } }, 35000);/' "$WS_MESSAGE_HANDLER"
+```
+
 ### Status
 - ✅ Root cause identified
-- ✅ Fix implemented (see below)
-- ⏳ Needs testing
-- ⏳ Update runtime patch
-- ⏳ Update PR description
+- ✅ Fix implemented in eufy-security-client fork (commit e49f670)
+- ✅ Runtime patch deployed (v1.9.24)
+- ✅ **Tested and confirmed working** (Dec 9, 2025)
+- ⏳ Upstream PR prepared (draft)
+
+### Test Evidence (v1.9.24)
+
+```
+17:23:41 Eufy Security server listening on host 0.0.0.0, port 3000
+17:23:42 Connected to station T84A1P1025020FEF
+17:23:42 Connected to station T84A1P1025021F7C
+[eufy-ws-patch] Stream timeout for T84A1P1025021F7C - clearing receiveLivestream flag
+[eufy-ws-patch] Stream timeout for T84A1P1025020FEF - clearing receiveLivestream flag
+17:26:20 Stopping the station stream for T84A1P1025020FEF (no data for 5 seconds)
+17:26:34 Stopping the station stream for T84A1P1025021F7C (no data for 5 seconds)
+17:27:08 Connected to station T84A1P1025020FEF  <-- Successfully reconnected!
+17:27:23 Connected to station T84A1P1025021F7C  <-- Successfully reconnected!
+```
+
+Cameras no longer get stuck in "preparing" mode!
 
 ### Device Context
 - **Camera**: T84A1 Wall Light Cam S100 (DeviceType.WALL_LIGHT_CAM = 151)
@@ -173,35 +219,166 @@ Both issues are now addressed:
 - **Problem**: Corrupted packets cause infinite loop
 - **Solution**: Detect and discard malformed initial packets
 - **Runtime Patchable**: ✅ Yes
+- **Upstream PR**: eufy-security-client
 
 ### Fix 2: Race Condition Prevention (commit 885bfd6)
 - **Problem**: Race between stream timeout and new stream start
 - **Solution**: Add `p2pStreamEnding` flag to block new streams during cleanup
 - **Runtime Patchable**: ❌ No (requires interface changes)
+- **Upstream PR**: eufy-security-client
 
-### Fix 3: Stop Event Always Emitted (NEW)
-- **Problem**: Stream stop event not emitted if no data received, leaving eufy-security-ws stuck
+### Fix 3: Stop Event Always Emitted (commit e49f670)
+- **Problem**: Stream stop event not emitted if no data received
 - **Solution**: Remove `!p2pStreamNotStarted` condition from `emitStreamStopEvent()` call
 - **Runtime Patchable**: ✅ Yes
+- **Upstream PR**: eufy-security-client
+
+### Fix 4: Timeout Fallback for receiveLivestream (v1.9.24)
+- **Problem**: Event chain fails when channel=-1, leaving eufy-security-ws stuck
+- **Solution**: Add 35-second timeout in message_handler.js to clear flag
+- **Runtime Patchable**: ✅ Yes
+- **Upstream PR**: eufy-security-ws
 
 ## References
 - Upstream Issue: bropat/eufy-security-client#690 (similar infinite loop, residual data only)
 - Fork: evertide/eufy-security-client
   - commit e7ff847: malformed packet fix
   - commit 885bfd6: race condition fix (p2pStreamEnding flag)
-  - commit TBD: stop event fix
-- Add-on: hassio-eufy-security-ws v1.9.13 (runtime patch deployed)
+  - commit e49f670: stop event fix
+- Fork: evertide/hassio-eufy-security-ws
+  - v1.9.24: runtime patches for all fixes
 - Documentation: hassio-eufy-security-ws/eufy-security-ws/PATCH_INFO.md
 
-## Upstream Pull Request
+---
 
-### PR Status: DRAFT ⏸️
+## Upstream Pull Requests (DRAFT)
+
+### PR #1: eufy-security-client - P2P Stream Reliability Fixes
+
 **Repository**: bropat/eufy-security-client  
-**PR Description**: Needs update in `PR_DESCRIPTION.md`
+**Title**: Fix P2P stream reliability issues (malformed packets, race conditions, event emission)
 
-### All Fixes Ready for PR
-1. ✅ Malformed packet detection
-2. ✅ p2pStreamEnding race condition fix
-3. ✅ Stop event always emitted fix
+#### Description
 
-All three fixes are complementary and address different failure modes.
+This PR addresses three related issues that cause P2P video streams to fail or become stuck:
+
+##### Issue 1: Malformed Initial P2P Packets
+
+**Problem**: Corrupted packets (due to weak WiFi or network issues) cause infinite loops in the P2P stream parser when they don't start with the expected MAGIC_WORD "XZYH".
+
+**Solution**: Add detection for malformed initial packets and discard them safely:
+
+```typescript
+// In parseDataMessage() - detect and discard malformed packets
+if (!firstPartMessage && this.currentMessageBuilder[message.type].header.bytesToRead === 0) {
+    rootP2PLogger.info(`Discarding malformed P2P packet`, {
+        stationSN: this.rawStation.station_sn,
+        seqNo: message.seqNo,
+        first4Bytes: data.subarray(0, 4).toString('hex')
+    });
+    data = Buffer.from([]);
+    this.currentMessageState[message.type].leftoverData = Buffer.from([]);
+    break;
+}
+```
+
+##### Issue 2: Race Condition During Stream Cleanup
+
+**Problem**: When a stream times out, there's a window where a new `startLivestream()` can be called before `endStream()` completes, causing state corruption.
+
+**Solution**: Add `p2pStreamEnding` flag to prevent new streams during cleanup:
+
+```typescript
+// In P2PClientProtocolEvents interface
+p2pStreamEnding: boolean;
+
+// In endStream() - set flag before cleanup
+this.currentMessageState[datatype].p2pStreamEnding = true;
+// ... cleanup ...
+this.currentMessageState[datatype].p2pStreamEnding = false;
+
+// In startStream() - check flag
+if (this.currentMessageState[datatype].p2pStreamEnding) {
+    throw new LivestreamAlreadyRunningError("Stream is currently ending");
+}
+```
+
+##### Issue 3: Stop Event Not Emitted Without Data
+
+**Problem**: When a stream times out without receiving ANY video data, `p2pStreamNotStarted` is still `true`, causing `emitStreamStopEvent()` to be skipped. This leaves downstream consumers (like eufy-security-ws) with stale state.
+
+**Solution**: Remove the `p2pStreamNotStarted` condition:
+
+```typescript
+// Before (buggy):
+if (!this.currentMessageState[datatype].invalidStream && 
+    !this.currentMessageState[datatype].p2pStreamNotStarted)
+    this.emitStreamStopEvent(datatype);
+
+// After (fixed):
+if (!this.currentMessageState[datatype].invalidStream)
+    this.emitStreamStopEvent(datatype);
+```
+
+#### Testing
+
+- Tested on T84A1 Wall Light Cam S100 cameras
+- Confirmed malformed packet detection works (420 packets safely discarded in 11 minutes)
+- Confirmed stream recovery works after WiFi improvement (0 corrupted packets)
+- Confirmed stuck stream issue resolved (cameras no longer stuck in "preparing" mode)
+
+#### Related Issues
+
+- Partially addresses #690 (infinite loop issue - this PR adds additional safeguards)
+
+---
+
+### PR #2: eufy-security-ws - Add Stream Timeout Fallback
+
+**Repository**: bropat/eufy-security-ws  
+**Title**: Add timeout fallback to clear receiveLivestream flag
+
+#### Description
+
+**Problem**: When `eufy-security-client` fails to emit the "station livestream stop" event (due to channel=-1 lookup failure when no data was received), the `receiveLivestream[serialNumber]` flag remains `true` indefinitely, causing all subsequent `startLivestream()` calls to fail with `LivestreamAlreadyRunningError`.
+
+**Root Cause**: When a stream is started but no video data is ever received:
+1. `message_handler.js` sets `client.receiveLivestream[serialNumber] = true`
+2. Stream times out after 5 seconds with no data
+3. `eufy-security-client` emits "livestream stopped" with `channel = -1`
+4. `eufysecurity.js` calls `getStationDevice(stationSN, -1)` which throws `DeviceNotFoundError`
+5. The error is caught but "station livestream stop" event is never emitted
+6. `forward.js` never receives the event to clear `receiveLivestream`
+7. All future `startLivestream()` calls fail
+
+**Solution**: Add a 35-second timeout fallback that clears the `receiveLivestream` flag if the stream never actually delivers data:
+
+```javascript
+// In message_handler.js, after setting receiveLivestream = true
+client.receiveLivestream[serialNumber] = true;
+
+// Fallback timeout: clear flag if stream never delivers data
+setTimeout(() => {
+    if (client.receiveLivestream[serialNumber] === true) {
+        console.log(`[timeout] Clearing stuck receiveLivestream flag for ${serialNumber}`);
+        client.receiveLivestream[serialNumber] = false;
+    }
+}, 35000); // 35 seconds (longer than P2P streaming timeout)
+```
+
+#### Testing
+
+Tested on T84A1 Wall Light Cam S100 cameras that were consistently getting stuck in "preparing" mode:
+
+```
+[eufy-ws-patch] Stream timeout for T84A1P1025021F7C - clearing receiveLivestream flag
+[eufy-ws-patch] Stream timeout for T84A1P1025020FEF - clearing receiveLivestream flag
+```
+
+After the timeout cleared the flags, cameras successfully reconnected and streams could be started again.
+
+#### Notes
+
+- This is a safety net - the proper fix is in `eufy-security-client` to always emit the stop event
+- Both fixes together provide defense in depth
+- The 35-second timeout is longer than the P2P streaming timeout (30 seconds) to allow normal event flow to work first

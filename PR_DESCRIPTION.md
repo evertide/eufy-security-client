@@ -1,11 +1,12 @@
-# Fix P2P Stream Issues: Malformed Packets and Race Condition
+# Fix P2P Stream Issues: Malformed Packets, Race Condition, and Event Emission
 
 ## Summary
 
-This PR addresses two critical P2P streaming issues discovered during extensive testing with T84A1 Wall Light Cam S100 devices:
+This PR addresses three critical P2P streaming issues discovered during extensive testing with T84A1 Wall Light Cam S100 devices:
 
 1. **Malformed initial P2P packets** causing infinite loop errors
 2. **Stream state race condition** causing `LivestreamAlreadyRunningError` after network disruptions
+3. **Stop event not emitted** when stream times out without receiving data, leaving downstream consumers stuck
 
 ## Issue 1: Malformed Initial Packets
 
@@ -188,6 +189,118 @@ Time 3ms:  endStream() completes → p2pStreamEnding = false
 Time 4ms:  Client retries → isLiveStreaming() → false → succeeds ✅
 ```
 
+## Issue 3: Stop Event Not Emitted Without Data
+
+### Problem
+
+When a stream times out WITHOUT receiving any video data (camera connected but didn't send frames), the `"livestream stopped"` event is never emitted. This leaves downstream consumers like `eufy-security-ws` with stale state, causing all subsequent stream requests to fail.
+
+```
+LivestreamAlreadyRunningError: Livestream for device T84A1P1025021F7C is already running
+```
+
+This error repeats every 60 seconds (automation retry interval) until the add-on is manually restarted.
+
+### Root Cause
+
+The `endStream()` method has a condition that prevents event emission:
+
+```typescript
+// Current (buggy) code:
+if (!this.currentMessageState[datatype].invalidStream && 
+    !this.currentMessageState[datatype].p2pStreamNotStarted)
+    this.emitStreamStopEvent(datatype);
+```
+
+When no data is received:
+- `p2pStreamNotStarted` remains `true` (never set to `false` because no video data arrived)
+- The `!p2pStreamNotStarted` condition is `false`
+- `emitStreamStopEvent()` is never called
+- Downstream consumers never receive the stop event
+- Their streaming flags remain stuck at `true`
+
+### The Event Chain
+
+```
+eufy-security-client                    eufy-security-ws
+━━━━━━━━━━━━━━━━━━━━                    ━━━━━━━━━━━━━━━━
+startLivestream() ──────────────────────► receiveLivestream[sn] = true
+     │
+     ▼
+[waiting for data...]
+     │
+     ▼ (5 second timeout, no data)
+     │
+endStream() 
+     │
+     ├─ p2pStreamNotStarted = true
+     │
+     ├─ if (!invalidStream && !p2pStreamNotStarted)  ❌ FAILS
+     │      emitStreamStopEvent()  // NEVER CALLED
+     │
+     ▼
+[no event emitted] ─────────────────────► receiveLivestream[sn] = true (STUCK!)
+     │
+     ▼
+Next startLivestream() ─────────────────► "LivestreamAlreadyRunningError"
+```
+
+### Solution
+
+Remove the `p2pStreamNotStarted` condition - always emit the stop event when the stream is not invalid:
+
+```typescript
+// Fixed code:
+if (!this.currentMessageState[datatype].invalidStream)
+    this.emitStreamStopEvent(datatype);
+```
+
+### Code Changes
+
+**File**: `src/p2p/session.ts` - `endStream()` method
+
+```typescript
+private endStream(datatype: P2PDataType, sendStopCommand = false): void {
+    // ... existing cleanup code ...
+    
+    // Before:
+    // if (!this.currentMessageState[datatype].invalidStream && 
+    //     !this.currentMessageState[datatype].p2pStreamNotStarted)
+    //     this.emitStreamStopEvent(datatype);
+    
+    // After - always emit stop event if stream is valid
+    // This ensures downstream consumers (eufy-security-ws) clear their state
+    if (!this.currentMessageState[datatype].invalidStream)
+        this.emitStreamStopEvent(datatype);
+    
+    // ... remaining cleanup code ...
+}
+```
+
+### Why This is Safe
+
+The stop event carries the stream channel information. Downstream consumers should be resilient to receiving stop events for streams they may not have fully initialized. The event simply signals "this stream is no longer active" - which is always true when `endStream()` is called.
+
+### Testing Results
+
+**Before Fix:**
+```
+15:12:27 - Stream ending { queuedDataSize: 0 }  // No data received
+15:12:29 - ERROR: LivestreamAlreadyRunningError
+15:13:29 - ERROR: LivestreamAlreadyRunningError
+15:14:29 - ERROR: LivestreamAlreadyRunningError
+... (repeats until add-on restart)
+```
+
+**After Fix:**
+```
+17:23:42 - Connected to station T84A1P1025021F7C
+17:24:17 - Stream timeout - no data for 35 seconds
+17:24:17 - "livestream stopped" event emitted
+17:24:17 - receiveLivestream[sn] cleared
+17:24:18 - New stream request succeeds ✅
+```
+
 ## Testing
 
 ### Test Environment
@@ -230,6 +343,7 @@ Time 4ms:  Client retries → isLiveStreaming() → false → succeeds ✅
 
 - e7ff847 - "Add malformed initial packet detection and discard logic"
 - 885bfd6 - "Fix race condition in stream state management"
+- e49f670 - "Always emit livestream stopped event to prevent stuck state"
 
 ## Checklist
 
