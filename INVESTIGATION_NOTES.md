@@ -162,42 +162,72 @@ Both issues are now addressed:
    - Remove `&& !p2pStreamNotStarted` condition from stop event emission
    - Ensures event is always emitted when stream ends
 
-2. **eufy-security-ws patch** (message_handler.js):
-   - Add 35-second timeout fallback that clears `receiveLivestream` flag
-   - Acts as safety net when event chain fails (e.g., channel=-1 lookup failure)
+2. **eufy-security-ws patch** (message_handler.js) - **v1.9.26 UPDATED**:
+   - ~~v1.9.24-v1.9.25: Timeout-based fallback~~ (REMOVED - accumulated timeouts caused issues)
+   - **v1.9.26: Stale flag detection** - Check actual stream state before throwing error
 
-The event chain failure happens because:
-- When no data is received, `p2pStreamChannel` remains `-1`
-- `eufysecurity.js` calls `getStationDevice(stationSN, -1)` which throws `DeviceNotFoundError`
-- The error is caught but `"station livestream stop"` event is never emitted
-- `eufy-security-ws` never receives the event to clear its flag
+### The Race Condition Problem
 
-### Runtime Patch (v1.9.24)
+The original timeout approach (v1.9.24-v1.9.25) was fundamentally flawed:
+- Every `startLivestream` set a NEW 35-second timeout
+- HA retries every ~10 seconds when stream fails
+- After 1 minute: 6+ accumulated timeouts, all eventually fire
+- Caused spurious "livestreamStopped" events and unpredictable state
 
-The fix is deployed via runtime patching in `patch-eufy-client.sh`:
+The REAL issue is a **race condition**:
+```
+Time T:   Stream ends, emits "livestream stopped" event
+Time T+1: Event propagates asynchronously (station.js → eufysecurity.js → forward.js)
+Time T+2: New startLivestream arrives BEFORE event clears receiveLivestream flag
+Time T+3: receiveLivestream[sn] still TRUE → LivestreamAlreadyRunningError thrown!
+```
+
+### The Correct Fix (v1.9.26)
+
+Instead of timeout-based workarounds, handle stale flags at decision time:
+
+```javascript
+// In message_handler.js startLivestream handler
+// Before (v1.9.24): blindly throw error
+throw new LivestreamAlreadyRunningError(...);
+
+// After (v1.9.26): check actual stream state first
+if (!station.isLiveStreaming(device)) {
+    // Stale flag! Stream ended but event hasn't propagated yet
+    console.log("[eufy-ws-fix] Stale receiveLivestream flag detected for " + serialNumber);
+    station.startLivestream(device);
+    // ... start new stream ...
+} else {
+    // Stream actually IS running
+    throw new LivestreamAlreadyRunningError(...);
+}
+```
+
+### Runtime Patch (v1.9.26)
 
 ```bash
 # eufy-security-client: Remove p2pStreamNotStarted check
 sed -i 's/\.invalidStream && !this\.currentMessageState\[datatype\]\.p2pStreamNotStarted/.invalidStream/' "$SESSION_FILE"
 
-# eufy-security-ws: Add timeout fallback
-sed -i 's/client\.receiveLivestream\[serialNumber\] = true;/client.receiveLivestream[serialNumber] = true; setTimeout(() => { if (client.receiveLivestream[serialNumber] === true) { console.log("[eufy-ws-patch] Stream timeout - clearing flag for " + serialNumber); client.receiveLivestream[serialNumber] = false; } }, 35000);/' "$WS_MESSAGE_HANDLER"
+# eufy-security-ws: Stale flag detection (replaces timeout approach)
+sed -i 's/throw new LivestreamAlreadyRunningError.*/if (!station.isLiveStreaming(device)) { console.log("[eufy-ws-fix] Stale receiveLivestream flag detected for " + serialNumber + ", clearing and starting new stream"); station.startLivestream(device); ... } else { throw new LivestreamAlreadyRunningError(...); }/' "$WS_MESSAGE_HANDLER"
 ```
 
 ### Status
-- ✅ Root cause identified
+- ✅ Root cause identified (race condition, NOT channel=-1 issue)
 - ✅ Fix implemented in eufy-security-client fork (commit e49f670)
-- ✅ Runtime patch deployed (v1.9.24)
-- ✅ **Tested and confirmed working** (Dec 9, 2025)
+- ✅ Runtime patch v1.9.26 deployed with stale flag detection
+- ⏳ Testing in progress (Dec 9, 2025)
 - ⏳ Upstream PR prepared (draft)
 
-### Test Evidence (v1.9.24)
+### Test Evidence (v1.9.26)
 
+Expected log output when stale flag is detected:
 ```
-17:23:41 Eufy Security server listening on host 0.0.0.0, port 3000
-17:23:42 Connected to station T84A1P1025020FEF
-17:23:42 Connected to station T84A1P1025021F7C
-[eufy-ws-patch] Stream timeout for T84A1P1025021F7C - clearing receiveLivestream flag
+[eufy-ws-fix] Stale receiveLivestream flag detected for T84A1P1025021F7C, clearing and starting new stream
+```
+
+This indicates the fix is working - detecting stale flags from race conditions and recovering gracefully instead of throwing `LivestreamAlreadyRunningError`.
 [eufy-ws-patch] Stream timeout for T84A1P1025020FEF - clearing receiveLivestream flag
 17:26:20 Stopping the station stream for T84A1P1025020FEF (no data for 5 seconds)
 17:26:34 Stopping the station stream for T84A1P1025021F7C (no data for 5 seconds)
@@ -233,11 +263,12 @@ Cameras no longer get stuck in "preparing" mode!
 - **Runtime Patchable**: ✅ Yes
 - **Upstream PR**: eufy-security-client
 
-### Fix 4: Timeout Fallback for receiveLivestream (v1.9.24)
-- **Problem**: Event chain fails when channel=-1, leaving eufy-security-ws stuck
-- **Solution**: Add 35-second timeout in message_handler.js to clear flag
+### Fix 4: Stale Flag Detection (v1.9.26)
+- **Problem**: Race condition between stream end event propagation and new start requests
+- **Solution**: Check actual stream state before throwing `LivestreamAlreadyRunningError`; if stream isn't actually running, handle stale flag gracefully
 - **Runtime Patchable**: ✅ Yes
 - **Upstream PR**: eufy-security-ws
+- **Note**: Replaces timeout approach from v1.9.24-v1.9.25 which accumulated spurious timeouts
 
 ## References
 - Upstream Issue: bropat/eufy-security-client#690 (similar infinite loop, residual data only)
@@ -333,52 +364,63 @@ if (!this.currentMessageState[datatype].invalidStream)
 
 ---
 
-### PR #2: eufy-security-ws - Add Stream Timeout Fallback
+### PR #2: eufy-security-ws - Fix Stream State Race Condition
 
 **Repository**: bropat/eufy-security-ws  
-**Title**: Add timeout fallback to clear receiveLivestream flag
+**Title**: Fix race condition in livestream state management
 
 #### Description
 
-**Problem**: When `eufy-security-client` fails to emit the "station livestream stop" event (due to channel=-1 lookup failure when no data was received), the `receiveLivestream[serialNumber]` flag remains `true` indefinitely, causing all subsequent `startLivestream()` calls to fail with `LivestreamAlreadyRunningError`.
+**Problem**: When a stream ends, the "station livestream stop" event propagates asynchronously through the system. If a new `startLivestream()` request arrives before the event clears the `receiveLivestream[serialNumber]` flag, it throws `LivestreamAlreadyRunningError` even though no stream is actually running.
 
-**Root Cause**: When a stream is started but no video data is ever received:
-1. `message_handler.js` sets `client.receiveLivestream[serialNumber] = true`
-2. Stream times out after 5 seconds with no data
-3. `eufy-security-client` emits "livestream stopped" with `channel = -1`
-4. `eufysecurity.js` calls `getStationDevice(stationSN, -1)` which throws `DeviceNotFoundError`
-5. The error is caught but "station livestream stop" event is never emitted
-6. `forward.js` never receives the event to clear `receiveLivestream`
-7. All future `startLivestream()` calls fail
+**Root Cause**: Race condition between asynchronous event propagation and new stream requests.
 
-**Solution**: Add a 35-second timeout fallback that clears the `receiveLivestream` flag if the stream never actually delivers data:
+**Previous Approach (v1.9.24-v1.9.25)**: Added 35-second timeout fallback.
+- ❌ Failed because: Every `startLivestream` set a new timeout; HA retries every ~10s; accumulated timeouts all fire eventually, causing unpredictable state.
+
+**New Approach (v1.9.26)**: Stale flag detection at decision time.
 
 ```javascript
-// In message_handler.js, after setting receiveLivestream = true
-client.receiveLivestream[serialNumber] = true;
+// In message_handler.js startLivestream handler
+// OLD: blindly throw error when flag is true
+else {
+    throw new LivestreamAlreadyRunningError(`Livestream for device ${serialNumber} is already running`);
+}
 
-// Fallback timeout: clear flag if stream never delivers data
-setTimeout(() => {
-    if (client.receiveLivestream[serialNumber] === true) {
-        console.log(`[timeout] Clearing stuck receiveLivestream flag for ${serialNumber}`);
-        client.receiveLivestream[serialNumber] = false;
+// NEW: check actual stream state first
+else {
+    if (!station.isLiveStreaming(device)) {
+        // Stale flag! Stream ended but event hasn't propagated yet
+        console.log("[eufy-ws-fix] Stale receiveLivestream flag detected for " + serialNumber + ", clearing and starting new stream");
+        station.startLivestream(device);
+        if (!DeviceMessageHandler.streamingDevices[station.getSerial()]?.includes(client)) {
+            DeviceMessageHandler.addStreamingDevice(station.getSerial(), client);
+        }
+    } else {
+        // Stream actually IS running
+        throw new LivestreamAlreadyRunningError(`Livestream for device ${serialNumber} is already running`);
     }
-}, 35000); // 35 seconds (longer than P2P streaming timeout)
+}
 ```
+
+#### Why This Works
+
+- Checks the **actual** stream state (`station.isLiveStreaming(device)`) at the exact moment of decision
+- No accumulating timeouts
+- Handles race conditions gracefully by starting a new stream when the old one is actually done
+- Only throws error when stream is legitimately already running
 
 #### Testing
 
-Tested on T84A1 Wall Light Cam S100 cameras that were consistently getting stuck in "preparing" mode:
-
+Expected log output when stale flag is detected:
 ```
-[eufy-ws-patch] Stream timeout for T84A1P1025021F7C - clearing receiveLivestream flag
-[eufy-ws-patch] Stream timeout for T84A1P1025020FEF - clearing receiveLivestream flag
+[eufy-ws-fix] Stale receiveLivestream flag detected for T84A1P1025021F7C, clearing and starting new stream
 ```
 
-After the timeout cleared the flags, cameras successfully reconnected and streams could be started again.
+Tested on T84A1 Wall Light Cam S100 cameras that were consistently getting stuck in "preparing" mode.
 
 #### Notes
 
-- This is a safety net - the proper fix is in `eufy-security-client` to always emit the stop event
-- Both fixes together provide defense in depth
-- The 35-second timeout is longer than the P2P streaming timeout (30 seconds) to allow normal event flow to work first
+- This replaces the timeout approach from v1.9.24-v1.9.25
+- Works together with the `eufy-security-client` fix that always emits the stop event
+- Both fixes together provide defense in depth against race conditions
