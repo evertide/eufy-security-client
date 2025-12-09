@@ -110,31 +110,63 @@ The race condition occurs at **application layer** (eufy-security-ws):
 4. Client sees streaming=true, throws error
 5. By the time error is thrown, endStream() has already completed
 
-### Potential Solutions
+### Solution Implemented - RESOLVED ✅
 
-#### Option 1: Add state synchronization lock (P2P layer)
-- Add mutex/lock around streaming state changes
-- Prevent `startLivestream()` and `endStream()` from executing simultaneously
-- Pro: Fixes race at protocol level
-- Con: Requires careful deadlock prevention
+**Option 3: Stream state event synchronization** (chosen for clean implementation)
 
-#### Option 2: Retry logic with state validation (Application layer)
-- Catch `LivestreamAlreadyRunningError` in eufy-security-ws
-- Wait brief period and retry if state was transitioning
-- Pro: Non-invasive to core library
-- Con: Doesn't fix root cause
+#### Changes Made
 
-#### Option 3: Stream state event synchronization
-- Add "stream ending" event before actual end
-- Block new stream starts while ending in progress
-- Pro: Clean separation of concerns
-- Con: Requires API changes
+1. **Add `p2pStreamEnding` flag** to `P2PDataMessageState` interface
+   - Boolean flag indicates stream teardown in progress
+   - Prevents new streams from starting during cleanup
 
-#### Option 4: Add "stale check" to isLiveStreaming()
-- Check if stream is actually active (recent packets)
-- Return false for stale/ending streams
-- Pro: Minimal code change
-- Con: Adds complexity to state check
+2. **Update `endStream()` method** in `src/p2p/session.ts`
+   - Set `p2pStreamEnding = true` at start of method
+   - Clear `p2pStreamEnding = false` after cleanup completes
+   - Prevents race condition window from opening
+
+3. **Update `isStreaming()` method** to check both flags
+   ```typescript
+   return this.currentMessageState[datatype].p2pStreaming || 
+          this.currentMessageState[datatype].p2pStreamEnding;
+   ```
+   - Blocks new stream starts while existing stream ending
+   - `startLivestream()` will correctly see "streaming" state
+
+4. **Initialize flag** in `initializeMessageState()`
+   - Set `p2pStreamEnding: false` on initialization
+   - Ensures clean starting state
+
+#### How It Works
+
+**Before Fix (Race Condition):**
+```
+Time 0ms:  isLiveStreaming(F7C) → false (client checks)
+Time 1ms:  timeout fires → endStream() starts
+Time 2ms:  startLivestream(F7C) → checks again → false → proceeds
+Time 3ms:  endStream() sets p2pStreaming = false
+Time 4ms:  startLivestream() sets p2pStreaming = true
+Time 5ms:  endStream() calls initializeMessageState() → resets everything
+Time 6ms:  ERROR: p2pStreaming mismatch → LivestreamAlreadyRunningError
+```
+
+**After Fix (Race Prevented):**
+```
+Time 0ms:  isLiveStreaming(F7C) → false (client checks)
+Time 1ms:  timeout fires → endStream() starts
+Time 1ms:  endStream() sets p2pStreamEnding = true ✅
+Time 2ms:  startLivestream(F7C) → checks isLiveStreaming()
+Time 2ms:  isLiveStreaming() → p2pStreamEnding = true → returns true ✅
+Time 2ms:  startLivestream() → throws LivestreamAlreadyRunningError (expected!)
+Time 3ms:  endStream() completes → sets p2pStreamEnding = false
+Time 4ms:  Client retries → isLiveStreaming() → false → succeeds ✅
+```
+
+### Status
+- ✅ Fix implemented in eufy-security-client (commit 885bfd6)
+- ⏳ Runtime patch needs updating for hassio-eufy-security-ws
+- ⏳ Testing with network disruption scenarios
+- ⏳ Upstream PR to be updated with both fixes
 
 ### Device Context
 - **Camera**: T84A1 Wall Light Cam S100 (DeviceType.WALL_LIGHT_CAM = 151)
