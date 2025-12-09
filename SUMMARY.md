@@ -1,148 +1,151 @@
-# P2P Stream Issues: Investigation Complete ✅
+# P2P Stream Issues: Investigation Status
 
 ## Summary
 
-Comprehensive investigation and fix for T84A1 Wall Light Cam S100 P2P streaming issues, addressing both immediate problems and underlying root cause.
+Investigation and fix development for T84A1 Wall Light Cam S100 P2P streaming issues.
 
-## Issues Identified & Resolved
+## Development Workflow
 
-### 1. Malformed P2P Packets - FIXED ✅
+### Repository Structure
+| Repository | Purpose | GitHub |
+|------------|---------|--------|
+| `eufy-security-client` | Core P2P library | evertide/eufy-security-client |
+| `eufy-security-ws` | WebSocket server | (upstream only) |
+| `hassio-eufy-security-ws` | Home Assistant Add-on | evertide/hassio-eufy-security-ws |
+
+### Deploy Cycle
+1. **Analyze locally** → Debug in local repos
+2. **Push to GitHub** → Commit to our forks
+3. **Bump version** → Increment by `.1` in `config.yaml`
+4. **HA builds** → Automatic from GitHub
+5. **Install & test** → HA installs new version
+
+### Important Limitation
+The add-on uses **npm package** (eufy-security-client@3.5.0), NOT our fork.  
+Runtime patches via `sed` can only modify JavaScript, not TypeScript interfaces.
+
+## Issues Overview
+
+| Issue | Status | Runtime Patchable | PR Ready |
+|-------|--------|-------------------|----------|
+| 1. Malformed Packets | ✅ FIXED | ✅ Yes | ✅ Yes |
+| 2. State Management | 🔧 IN PROGRESS | ❌ No (needs interface) | ⏸️ Partial |
+
+## Issue 1: Malformed P2P Packets - FIXED ✅
 
 **Problem**: "Infinite loop detected" errors causing stream crashes
 
-**Root Cause**: Weak WiFi signal (-70 dBm or worse) causing packet corruption
+**Root Cause**: Weak WiFi signal (-70 dBm+) causing packet corruption
 
 **Evidence**:
-- Before WiFi fix: 420 malformed packets / 11 minutes (38.2/min)
-- After WiFi fix: 0 malformed packets / 5 minutes
+- Before WiFi fix: 420 malformed packets / 11 min (38.2/min)
+- After WiFi fix: 0 malformed packets / 5 min
 - **100% elimination** with strong signal
 
-**Solution Implemented**:
-- Detect malformed initial packets (first 4 bytes ≠ MAGIC_WORD)
-- Discard and log with diagnostics (RSSI, queue size, rssiAge)
-- No crash, clean recovery
+**Solution**: Detect and discard malformed initial packets (first 4 bytes ≠ MAGIC_WORD)
 
-**Status**: ✅ Fixed in fork (commit e7ff847), runtime patched in add-on v1.9.10
+**Status**: 
+- ✅ Fixed in fork (commit e7ff847)
+- ✅ Runtime patched in add-on v1.9.13
+- ✅ PR description ready
 
-### 2. Stream State Race Condition - FIXED ✅
+## Issue 2: Stream State Management - IN PROGRESS 🔧
 
-**Problem**: `LivestreamAlreadyRunningError` after network disruption
+**Problem**: `LivestreamAlreadyRunningError` causing cameras to stay in "preparing" mode
 
-**Root Cause**: Race between stream timeout cleanup and client restart
+**Initial Diagnosis**: Race condition between stream timeout and client restart (373ms window)
 
-**Timeline**:
-```
-13:29:41.611 - endStream() called (5s timeout)
-13:29:41.984 - LivestreamAlreadyRunningError (373ms race window)
-```
+**Initial Fix**: Added `p2pStreamEnding` flag (commit 885bfd6)
 
-**Solution Implemented**:
-- Add `p2pStreamEnding` flag to block new streams during teardown
-- Prevents race condition by making state transition atomic
-- Client retry succeeds after cleanup completes
+**Current Status** (December 9, 2025):
+- ❌ After camera reboot, BOTH cameras stuck in "preparing" mode
+- ❌ 6x `LivestreamAlreadyRunningError` (increased from 3)
+- ❌ Error occurs 6+ seconds after endStream() - NOT a timing race
+- ❌ State not clearing properly after disconnect/reconnect
 
-**Status**: ✅ Fixed in fork (commit 885bfd6), documented for upstream
+**Investigation Ongoing**:
+- Initial race condition fix may be incomplete
+- Larger state synchronization issue between P2P and station layers
+- Need to trace full reconnect sequence
+
+**Limitation**: Cannot runtime patch - requires TypeScript interface changes
 
 ## Repositories Updated
 
 ### eufy-security-client Fork
 **Repository**: https://github.com/evertide/eufy-security-client
 **Branch**: master
-**Latest Commit**: 867abc0
+
+**Commits**:
+- e7ff847 - Malformed packet fix ✅
+- 885bfd6 - Race condition fix (partial) 🔧
+- Documentation updates
 
 **Changes**:
 1. `src/p2p/interfaces.ts` - Added `p2pStreamEnding` flag
 2. `src/p2p/session.ts` - Malformed packet detection + race condition fix
-3. `INVESTIGATION_NOTES.md` - Complete analysis and testing results
-4. `PR_DESCRIPTION.md` - Ready for upstream submission
-
-**Commits**:
-- e7ff847 - Malformed packet fix
-- 885bfd6 - Race condition fix  
-- 867abc0 - Documentation
+3. `INVESTIGATION_NOTES.md` - Complete analysis
+4. `PR_DESCRIPTION.md` - Ready for upstream (Issue 1 only)
+5. `SUMMARY.md` - This file
 
 ### hassio-eufy-security-ws Add-on
 **Repository**: https://github.com/evertide/hassio-eufy-security-ws
-**Branch**: master
-**Latest Commit**: e05229a
-**Version**: 1.9.10
+**Version**: 1.9.13
 
-**Changes**:
-1. `eufy-security-ws/patch-eufy-client.sh` - Runtime patches v1.9.10
-2. `eufy-security-ws/PATCH_INFO.md` - Complete documentation
-3. Patches applied: Malformed packet detection + RSSI tracking + diagnostics
-
-**Commits**:
-- 975ddf9 - RSSI tracking v1.9.10
-- e05229a - Race condition documentation
+**Runtime Patches Applied**:
+1. Malformed packet detection ✅
+2. WiFi RSSI tracking ✅
+3. Connection close diagnostics ✅
+4. Stream end diagnostics ✅
+5. Race condition detection logging ✅
 
 ## Testing Results
 
-### Malformed Packet Testing
-| Condition | Duration | Malformed Packets | Rate | Status |
-|-----------|----------|-------------------|------|--------|
-| Weak WiFi | 11 min | 420 | 38.2/min | ❌ Failing |
-| Strong WiFi | 5 min | 0 | 0/min | ✅ Perfect |
-| **Improvement** | - | **-100%** | **-100%** | **✅ Resolved** |
+### Malformed Packet Testing ✅
+| Condition | Duration | Malformed Packets | Status |
+|-----------|----------|-------------------|--------|
+| Weak WiFi | 11 min | 420 (38.2/min) | ❌ Failing |
+| Strong WiFi | 5 min | 0 (0/min) | ✅ Perfect |
 
-### Race Condition Testing
-- Network disruption: Clean disconnect ✅
-- Reconnection: Successful with no errors ✅  
-- Stream restart: No race condition ✅
-- Normal operation: No impact ✅
+### State Management Testing 🔧
+| Scenario | Before | After | Status |
+|----------|--------|-------|--------|
+| Normal operation | OK | OK | ✅ |
+| Network disruption | 3 errors | - | Was ⚠️ |
+| Camera reboot | - | 6 errors, stuck | ❌ NEW ISSUE |
 
 ## Upstream PR Status
 
-**Fork Ready**: ✅ All changes committed and pushed
-**PR Draft**: ✅ Complete description in PR_DESCRIPTION.md
-**Submission**: ⏸️ Held per user request
+### Issue 1 (Malformed Packets) - Ready ✅
+- Clean fix, no interface changes
+- Can be runtime patched
+- Well tested, 100% improvement
+- PR description in `PR_DESCRIPTION.md`
 
-**When to submit**:
-- User gives approval
-- Can be submitted immediately - all documentation ready
-- PR includes both fixes with complete testing evidence
-
-## Files Ready for Review
-
-### In eufy-security-client Fork
-1. `PR_DESCRIPTION.md` - Complete PR text ready to copy
-2. `INVESTIGATION_NOTES.md` - Detailed technical analysis
-3. `src/p2p/interfaces.ts` - Interface changes
-4. `src/p2p/session.ts` - Implementation
-
-### In hassio-eufy-security-ws
-1. `PATCH_INFO.md` - User-facing documentation
-2. `patch-eufy-client.sh` - Runtime patches v1.9.10
-
-## Recommendations
-
-### For T84A1 Cameras
-1. ✅ Ensure WiFi signal strength -60 dBm or better
-2. ✅ Use dedicated 2.4GHz AP on clear channel
-3. ✅ Monitor malformed packet rate as signal quality proxy
-4. ⚠️ Note: T84A1 cameras don't send CMD_WIFI_CONFIG (no real-time RSSI)
-
-### For Production Use
-1. ✅ Current runtime patches (v1.9.10) work well for malformed packets
-2. ⚠️ Race condition requires TypeScript changes (can't runtime patch)
-3. ✅ eufy-security-ws retry logic handles race condition gracefully
-4. 📋 Recommend using fork version for best results
+### Issue 2 (State Management) - Blocked 🔧
+- Initial fix may be incomplete
+- Larger issue discovered after camera reboot
+- Cannot runtime patch (needs interface changes)
+- Need full understanding before PR
 
 ## Next Steps
 
-1. **User Testing**: Monitor stability with current patches
-2. **Upstream PR**: Submit when user approves
-3. **Long-term**: Switch to official version once merged upstream
+1. **Investigate** why cameras stuck in "preparing" mode
+2. **Trace** full P2P reconnect sequence
+3. **Find** where state is not being cleared
+4. **Fix** the root cause in fork
+5. **Test** thoroughly before PR
+6. **Submit** Issue 1 PR to upstream (can be done independently)
 
 ## Key Learnings
 
-1. **WiFi Quality Critical**: Weak signal = packet corruption at protocol level
-2. **T84A1 Quirks**: No CMD_WIFI_CONFIG messages (unlike other Eufy devices)
-3. **Race Conditions**: Network disruptions expose timing issues
-4. **Diagnostics Matter**: RSSI/queue logging essential for root cause analysis
+1. **WiFi Quality Critical**: Weak signal = packet corruption
+2. **T84A1 Quirks**: No CMD_WIFI_CONFIG (can't track RSSI)
+3. **State Issues**: More complex than initially thought
+4. **Runtime Patching**: Limited - can't modify TypeScript interfaces
 
 ---
 
-**Status**: All work complete, ready for upstream submission
+**Status**: Issue 1 complete, Issue 2 needs more investigation
 **Date**: December 9, 2025
 **Maintainer**: @evertide

@@ -3,6 +3,34 @@
 ## Overview
 Investigation into P2P video stream parsing failures and state management issues for T84A1 Wall Light Cam S100 cameras.
 
+## Development Workflow
+
+### Repository Structure
+We maintain **three forked repositories** for development and testing:
+
+| Repository | Purpose | Local Path |
+|------------|---------|------------|
+| `eufy-security-client` | Core P2P library (this repo) | `/Users/evert/Documents/Code Development/eufy-security-client` |
+| `eufy-security-ws` | WebSocket server wrapper | (upstream only) |
+| `hassio-eufy-security-ws` | Home Assistant Add-on | `/Users/evert/Documents/Code Development/hassio-eufy-security-ws` |
+
+### Development → Deploy Cycle
+1. **Analyze locally** - Debug and develop fixes in local repos
+2. **Push to GitHub** - Push changes to our forked repos on GitHub
+3. **Bump version** - Increment add-on version by `.1` in `config.yaml`
+4. **HA builds** - Home Assistant automatically builds the add-on from GitHub
+5. **Install & test** - HA installs the new version for testing
+
+### Add-on Build Flow
+```
+hassio-eufy-security-ws (GitHub)
+    ├── Dockerfile installs eufy-security-ws@1.9.3 from npm
+    ├── eufy-security-ws pulls eufy-security-client@3.5.0 from npm
+    └── patch-eufy-client.sh applies runtime patches to session.js
+```
+
+**Important**: The add-on uses the **npm package** (eufy-security-client@3.5.0), NOT our fork directly. Changes requiring TypeScript interface modifications cannot be runtime patched - they need upstream PR acceptance.
+
 ## Issue 1: Malformed Initial P2P Packets - RESOLVED ✅
 
 ### Root Cause
@@ -163,26 +191,60 @@ Time 4ms:  Client retries → isLiveStreaming() → false → succeeds ✅
 ```
 
 ### Status
-- ✅ Fix implemented in eufy-security-client (commit 885bfd6)
-- ⏳ Runtime patch needs updating for hassio-eufy-security-ws
-- ⏳ Testing with network disruption scenarios
-- ⏳ Upstream PR to be updated with both fixes
+- ✅ Fix implemented in eufy-security-client fork (commit 885bfd6)
+- ⚠️ **Cannot be runtime patched** - requires TypeScript interface changes
+- ❌ **CURRENT ISSUE**: Cameras stuck in "preparing" mode after reboot
+
+### Current Problem (December 9, 2025)
+
+After rebooting both cameras, they reconnect but stay stuck in "preparing" mode:
+- Both cameras (F7C and 0FEF) affected
+- 6x `LivestreamAlreadyRunningError` logged (increased from 3)
+- Error occurs 6+ seconds after `endStream()` - NOT a timing race
+- Home Assistant automation tries to start stream but fails
+- Cameras should drop to idle after timeout, then automation restarts stream
+
+**Key Observation**: The 6-second gap between `endStream()` and the error suggests this is NOT the same race condition we fixed with `p2pStreamEnding`. The state is simply not clearing properly.
+
+**Hypothesis**: After camera reboot/reconnect:
+1. `_disconnected()` is called
+2. `endStream()` is called (if streaming)
+3. `_initialize()` resets state
+4. But something else is keeping `isLiveStreaming()` returning true
+
+**Investigation Needed**:
+- Check what happens during camera reconnect sequence
+- Verify `p2pStreamChannel` is being reset to -1
+- Check if station-level state is out of sync with p2p session state
+- Look at eufy-security-ws layer for additional state tracking
 
 ### Device Context
 - **Camera**: T84A1 Wall Light Cam S100 (DeviceType.WALL_LIGHT_CAM = 151)
-- **Affected Serial**: T84A1P1025021F7C
-- **Network**: 192.168.2.242:29721
+- **Affected Serials**: T84A1P1025021F7C (F7C), T84A1P102502D0FEF (0FEF)
+- **Networks**: F7C @ 192.168.2.242, 0FEF @ 192.168.2.52
 - **Note**: T84A1 cameras do NOT send CMD_WIFI_CONFIG, so RSSI tracking shows undefined
-
-### Next Steps
-1. Decide on solution approach
-2. Implement fix in eufy-security-client
-3. Test with network disruption scenarios
-4. Update runtime patch if needed
-5. Update upstream PR with both fixes
 
 ## References
 - Upstream Issue: bropat/eufy-security-client#690 (similar infinite loop, residual data only)
-- Fork: evertide/eufy-security-client (commit e7ff847 for malformed packet fix)
-- Add-on: hassio-eufy-security-ws v1.9.10 (runtime patch deployed)
+- Fork: evertide/eufy-security-client
+  - commit e7ff847: malformed packet fix
+  - commit 885bfd6: race condition fix (p2pStreamEnding flag)
+- Add-on: hassio-eufy-security-ws v1.9.13 (runtime patch deployed)
 - Documentation: hassio-eufy-security-ws/eufy-security-ws/PATCH_INFO.md
+
+## Upstream Pull Request
+
+### PR Status: DRAFT ⏸️
+**Repository**: bropat/eufy-security-client  
+**PR Description**: Ready in `PR_DESCRIPTION.md`
+
+### Issue 1 (Malformed Packets) - Ready for PR ✅
+- Clean fix with no interface changes
+- Can be applied via runtime patch OR upstream merge
+- Well tested with 100% improvement in affected environment
+
+### Issue 2 (State Management) - Investigation Ongoing 🔧
+- Initial race condition fix implemented (p2pStreamEnding flag)
+- Requires TypeScript interface changes (cannot runtime patch)
+- **NEW**: Cameras stuck in preparing mode suggests larger state issue
+- Need to fully understand before upstream PR
