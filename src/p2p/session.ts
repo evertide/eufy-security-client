@@ -2539,7 +2539,13 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
                 this.currentMessageState[datatype].p2pStreamingTimeout = undefined;
             }
 
-            if (!this.currentMessageState[datatype].invalidStream && !this.currentMessageState[datatype].p2pStreamNotStarted)
+            // Always emit stop event if stream was not invalid, even if no data was received
+            // This ensures eufy-security-ws clears its receiveLivestream flag
+            // Previously: only emitted if !p2pStreamNotStarted (data was received)
+            // Bug: eufy-security-ws sets receiveLivestream=true on startLivestream(), 
+            // but only clears it on "livestream stopped" event. If stream times out
+            // without receiving data, the event was never emitted, leaving the flag stuck.
+            if (!this.currentMessageState[datatype].invalidStream)
                 this.emitStreamStopEvent(datatype);
 
             if (this.currentMessageState[datatype].queuedData.size > 0) {

@@ -77,146 +77,89 @@ if (!firstPartMessage && bytesToRead === 0) {
 
 ### Status
 - ✅ Fix implemented in fork (commit e7ff847)
-- ✅ Runtime patch deployed in hassio-eufy-security-ws v1.9.10
+- ✅ Runtime patch deployed in hassio-eufy-security-ws v1.9.13
 - ✅ WiFi improvement confirmed 100% effective
 - ⏳ Upstream PR prepared but held as draft per user request
 
-## Issue 2: Stream State Race Condition - IN PROGRESS 🔧
+## Issue 2: Stream State Not Clearing - ROOT CAUSE FOUND ✅
 
-### Root Cause
-**Race condition between stream timeout and client stream restart** after network disruption.
+### Root Cause Identified
 
-### Symptoms
-- `LivestreamAlreadyRunningError` thrown when trying to start stream
-- Occurs after network disruption/reconnection
-- Timestamp analysis shows simultaneous `endStream()` and `startLivestream()` calls
+**Bug in `endStream()` method**: When a stream times out WITHOUT receiving any video data, the `"livestream stopped"` event is NOT emitted, causing `eufy-security-ws` to keep its `receiveLivestream` flag stuck at `true`.
 
-### Investigation Timeline
+### The Problem Chain
 
-**13:25:28** - Network disruption begins
+1. **eufy-security-ws** sets `client.receiveLivestream[serialNumber] = true` when `startLivestream()` is called
+2. **eufy-security-ws** only clears this flag when it receives `"station livestream stop"` event
+3. **eufy-security-client** only emits `"livestream stopped"` if `p2pStreamNotStarted = false`
+4. `p2pStreamNotStarted` is only set to `false` when video data is actually received
+5. If stream times out without data → event never emitted → flag never cleared → stuck!
+
+### Log Evidence
+
 ```
-Heartbeat check failed for station T84A1P1025020FEF. Connection seems lost.
-```
-
-**13:26:47-13:26:48** - Clean shutdown sequence
-```
-13:26:47.915 - endStream() called for F7C
-13:26:48.036 - onClose() for F7C: wasStreaming: false ✅
-13:26:48.162 - onClose() for 0FEF: wasStreaming: false ✅
-```
-→ Cleanup working correctly during shutdown
-
-**13:26:54** - Successful reconnection
-```
-Connected to station T84A1P1025021F7C on host 192.168.2.242
+15:12:27.952 - Stream ending { stationSN: 'T84A1P1025021F7C', queuedDataSize: 0 }
+                                                              ^^^^^^^^^^^^^^^^
+                                                              No data received!
+15:12:29.344 - ERROR: LivestreamAlreadyRunningError (only 1.4 seconds later)
 ```
 
-**13:29:41** - Race condition triggers
+Then every minute for 26+ minutes:
 ```
-13:29:41.611 - endStream() called: sendStopCommand: false, queuedDataSize: 0
-13:29:41.984 - ERROR: LivestreamAlreadyRunningError
+15:18:00 - LivestreamAlreadyRunningError F7C
+15:19:00 - LivestreamAlreadyRunningError F7C
+15:20:00 - LivestreamAlreadyRunningError F7C
+... (automation keeps retrying every minute, always fails)
 ```
 
-### Analysis
+### The Buggy Code (Before Fix)
 
-The cleanup logic in `_disconnected()` DOES work correctly:
 ```typescript
-private _disconnected(): void {
-    // ... clear timeouts ...
-    if (this.currentMessageState[P2PDataType.VIDEO].p2pStreaming) {
-        this.endStream(P2PDataType.VIDEO);  // ✅ Called correctly
-    }
-    // ... emit close event ...
-    this._initialize();
-}
+// In endStream() method - src/p2p/session.ts
+if (!this.currentMessageState[datatype].invalidStream && 
+    !this.currentMessageState[datatype].p2pStreamNotStarted)  // <-- BUG: requires data received
+    this.emitStreamStopEvent(datatype);
 ```
 
-The race condition occurs at **application layer** (eufy-security-ws):
-1. Client attempts to restart stream after reconnection
-2. P2P layer simultaneously ends stream due to 5-second data timeout
-3. `isLiveStreaming()` check in `startLivestream()` races with `endStream()`
-4. Client sees streaming=true, throws error
-5. By the time error is thrown, endStream() has already completed
+### The Fix
 
-### Solution Implemented - RESOLVED ✅
-
-**Option 3: Stream state event synchronization** (chosen for clean implementation)
-
-#### Changes Made
-
-1. **Add `p2pStreamEnding` flag** to `P2PDataMessageState` interface
-   - Boolean flag indicates stream teardown in progress
-   - Prevents new streams from starting during cleanup
-
-2. **Update `endStream()` method** in `src/p2p/session.ts`
-   - Set `p2pStreamEnding = true` at start of method
-   - Clear `p2pStreamEnding = false` after cleanup completes
-   - Prevents race condition window from opening
-
-3. **Update `isStreaming()` method** to check both flags
-   ```typescript
-   return this.currentMessageState[datatype].p2pStreaming || 
-          this.currentMessageState[datatype].p2pStreamEnding;
-   ```
-   - Blocks new stream starts while existing stream ending
-   - `startLivestream()` will correctly see "streaming" state
-
-4. **Initialize flag** in `initializeMessageState()`
-   - Set `p2pStreamEnding: false` on initialization
-   - Ensures clean starting state
-
-#### How It Works
-
-**Before Fix (Race Condition):**
-```
-Time 0ms:  isLiveStreaming(F7C) → false (client checks)
-Time 1ms:  timeout fires → endStream() starts
-Time 2ms:  startLivestream(F7C) → checks again → false → proceeds
-Time 3ms:  endStream() sets p2pStreaming = false
-Time 4ms:  startLivestream() sets p2pStreaming = true
-Time 5ms:  endStream() calls initializeMessageState() → resets everything
-Time 6ms:  ERROR: p2pStreaming mismatch → LivestreamAlreadyRunningError
+```typescript
+// Always emit stop event if stream was not invalid, even if no data was received
+// eufy-security-ws sets receiveLivestream=true on startLivestream(),
+// but only clears it on "livestream stopped" event
+if (!this.currentMessageState[datatype].invalidStream)
+    this.emitStreamStopEvent(datatype);
 ```
 
-**After Fix (Race Prevented):**
-```
-Time 0ms:  isLiveStreaming(F7C) → false (client checks)
-Time 1ms:  timeout fires → endStream() starts
-Time 1ms:  endStream() sets p2pStreamEnding = true ✅
-Time 2ms:  startLivestream(F7C) → checks isLiveStreaming()
-Time 2ms:  isLiveStreaming() → p2pStreamEnding = true → returns true ✅
-Time 2ms:  startLivestream() → throws LivestreamAlreadyRunningError (expected!)
-Time 3ms:  endStream() completes → sets p2pStreamEnding = false
-Time 4ms:  Client retries → isLiveStreaming() → false → succeeds ✅
-```
+### Why This Wasn't a Race Condition
+
+The initial diagnosis of "race condition" was incorrect. The real issue:
+- Stream was started (command acknowledged by camera)
+- Camera never sent any video data (queuedDataSize: 0)
+- 5-second timeout fired, `endStream()` called
+- `p2pStreamNotStarted = true` (never received data to set false)
+- Stop event NOT emitted
+- `eufy-security-ws` still thinks stream is running
+- All subsequent `startLivestream()` calls fail with `LivestreamAlreadyRunningError`
+
+### Previous Symptoms Explained
+
+The earlier "373ms race window" we observed was actually a different scenario:
+- Stream WAS receiving data
+- Network disruption caused timeout
+- Stop event WAS emitted (because data was received)
+- But new start came in during cleanup
+
+Both issues are now addressed:
+1. **p2pStreamEnding flag** (commit 885bfd6) - prevents race during active cleanup
+2. **Always emit stop event** (this fix) - ensures flag is cleared even with no data
 
 ### Status
-- ✅ Fix implemented in eufy-security-client fork (commit 885bfd6)
-- ⚠️ **Cannot be runtime patched** - requires TypeScript interface changes
-- ❌ **CURRENT ISSUE**: Cameras stuck in "preparing" mode after reboot
-
-### Current Problem (December 9, 2025)
-
-After rebooting both cameras, they reconnect but stay stuck in "preparing" mode:
-- Both cameras (F7C and 0FEF) affected
-- 6x `LivestreamAlreadyRunningError` logged (increased from 3)
-- Error occurs 6+ seconds after `endStream()` - NOT a timing race
-- Home Assistant automation tries to start stream but fails
-- Cameras should drop to idle after timeout, then automation restarts stream
-
-**Key Observation**: The 6-second gap between `endStream()` and the error suggests this is NOT the same race condition we fixed with `p2pStreamEnding`. The state is simply not clearing properly.
-
-**Hypothesis**: After camera reboot/reconnect:
-1. `_disconnected()` is called
-2. `endStream()` is called (if streaming)
-3. `_initialize()` resets state
-4. But something else is keeping `isLiveStreaming()` returning true
-
-**Investigation Needed**:
-- Check what happens during camera reconnect sequence
-- Verify `p2pStreamChannel` is being reset to -1
-- Check if station-level state is out of sync with p2p session state
-- Look at eufy-security-ws layer for additional state tracking
+- ✅ Root cause identified
+- ✅ Fix implemented (see below)
+- ⏳ Needs testing
+- ⏳ Update runtime patch
+- ⏳ Update PR description
 
 ### Device Context
 - **Camera**: T84A1 Wall Light Cam S100 (DeviceType.WALL_LIGHT_CAM = 151)
@@ -224,11 +167,29 @@ After rebooting both cameras, they reconnect but stay stuck in "preparing" mode:
 - **Networks**: F7C @ 192.168.2.242, 0FEF @ 192.168.2.52
 - **Note**: T84A1 cameras do NOT send CMD_WIFI_CONFIG, so RSSI tracking shows undefined
 
+## Summary of All Fixes
+
+### Fix 1: Malformed Packet Detection (commit e7ff847)
+- **Problem**: Corrupted packets cause infinite loop
+- **Solution**: Detect and discard malformed initial packets
+- **Runtime Patchable**: ✅ Yes
+
+### Fix 2: Race Condition Prevention (commit 885bfd6)
+- **Problem**: Race between stream timeout and new stream start
+- **Solution**: Add `p2pStreamEnding` flag to block new streams during cleanup
+- **Runtime Patchable**: ❌ No (requires interface changes)
+
+### Fix 3: Stop Event Always Emitted (NEW)
+- **Problem**: Stream stop event not emitted if no data received, leaving eufy-security-ws stuck
+- **Solution**: Remove `!p2pStreamNotStarted` condition from `emitStreamStopEvent()` call
+- **Runtime Patchable**: ✅ Yes
+
 ## References
 - Upstream Issue: bropat/eufy-security-client#690 (similar infinite loop, residual data only)
 - Fork: evertide/eufy-security-client
   - commit e7ff847: malformed packet fix
   - commit 885bfd6: race condition fix (p2pStreamEnding flag)
+  - commit TBD: stop event fix
 - Add-on: hassio-eufy-security-ws v1.9.13 (runtime patch deployed)
 - Documentation: hassio-eufy-security-ws/eufy-security-ws/PATCH_INFO.md
 
@@ -236,15 +197,11 @@ After rebooting both cameras, they reconnect but stay stuck in "preparing" mode:
 
 ### PR Status: DRAFT ⏸️
 **Repository**: bropat/eufy-security-client  
-**PR Description**: Ready in `PR_DESCRIPTION.md`
+**PR Description**: Needs update in `PR_DESCRIPTION.md`
 
-### Issue 1 (Malformed Packets) - Ready for PR ✅
-- Clean fix with no interface changes
-- Can be applied via runtime patch OR upstream merge
-- Well tested with 100% improvement in affected environment
+### All Fixes Ready for PR
+1. ✅ Malformed packet detection
+2. ✅ p2pStreamEnding race condition fix
+3. ✅ Stop event always emitted fix
 
-### Issue 2 (State Management) - Investigation Ongoing 🔧
-- Initial race condition fix implemented (p2pStreamEnding flag)
-- Requires TypeScript interface changes (cannot runtime patch)
-- **NEW**: Cameras stuck in preparing mode suggests larger state issue
-- Need to fully understand before upstream PR
+All three fixes are complementary and address different failure modes.
